@@ -179,11 +179,3 @@ if submitted:
         st.markdown(f"**Sentiment:** <span style='color:{sentiment_color}'>{sentiment_label}</span>", unsafe_allow_html=True)
         st.write(f"**Confidence:** {confidence * 100:.1f}%")
 
-# Optional: small help / notes
-st.markdown("---")
-st.markdown(
-    "Notes: This app expects model artifacts saved under `./model/` (or project root). "
-    "If you trained models elsewhere, place the following files in `./model/`:\n\n"
-    "- `topic_model_lda.pkl`\n- `topic_vectorizer.pkl`\n- `sentiment_classifier.pkl`\n- `topic_vectorizer_using_tfidf.pkl` OR `sentiment_vectorizer.pkl`\n\n"
-    "If you need, I can help rename/move your artifacts so the app finds them automatically."
-)
