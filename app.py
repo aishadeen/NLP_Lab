@@ -3,98 +3,187 @@ import joblib
 import json
 import numpy as np
 import re
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import PorterStemmer
+from pathlib import Path
 
-# =============================
-# Load All Saved Models
-# =============================
+# ---------------------------
+# Helper: robust model loader
+# ---------------------------
+def try_load_model(paths):
+    """Try loading first existing path from a list; return (obj, path) or (None, None)."""
+    for p in paths:
+        p = Path(p)
+        if p.exists():
+            try:
+                return joblib.load(str(p)), str(p)
+            except Exception as e:
+                st.error(f"Failed to load model from {p}: {e}")
+                return None, str(p)
+    return None, None
 
-lda = joblib.load("./model/topic_model_lda.pkl")
-vectorizer_topic = joblib.load("./model/topic_vectorizer.pkl")
+# ---------------------------
+# Load models (robust)
+# ---------------------------
+st.info("Loading models...")
 
-sentiment_model = joblib.load("./model/sentiment_classifier.pkl")
-tfidf = joblib.load("./model/topic_vectorizer_using_tfidf.pkl")
+lda, lda_path = try_load_model([
+    "./model/topic_model_lda.pkl",
+    "./topic_model_lda.pkl",
+    "model/topic_model_lda.pkl"
+])
+vectorizer_topic, vec_topic_path = try_load_model([
+    "./model/topic_vectorizer.pkl",
+    "./topic_vectorizer.pkl",
+    "model/topic_vectorizer.pkl"
+])
 
-with open("./model/topic_labels.json", "r", encoding="utf-8") as f:
-    topic_labels = json.load(f)
-topic_labels = {int(k): v for k, v in topic_labels.items()}
+# sentiment model
+sentiment_model, sent_model_path = try_load_model([
+    "./model/sentiment_classifier.pkl",
+    "./sentiment_classifier.pkl",
+    "model/sentiment_classifier.pkl"
+])
 
-# =============================
-# Preprocessing Functions
-# =============================
+# try multiple possible vectorizer filenames (historical mismatch)
+tfidf, tfidf_path = try_load_model([
+    "./model/topic_vectorizer_using_tfidf.pkl",   # original app used this name
+    "./model/sentiment_vectorizer.pkl",
+    "./model/topic_vectorizer.pkl",
+    "./sentiment_vectorizer.pkl",
+    "./topic_vectorizer_using_tfidf.pkl",
+    "./topic_vectorizer.pkl"
+])
 
-stop_words = set(stopwords.words("english"))
-stemmer = PorterStemmer()
+# topic labels
+topic_labels = {}
+labels_path = Path("./model/topic_labels.json")
+if labels_path.exists():
+    try:
+        with open(labels_path, "r", encoding="utf-8") as f:
+            topic_labels = json.load(f)
+            topic_labels = {int(k): v for k, v in topic_labels.items()}
+    except Exception as e:
+        st.error(f"Failed to load topic_labels.json: {e}")
+else:
+    # fallback: auto-generate simple labels if LDA is present
+    if lda is not None:
+        topic_labels = {i: f"Topic {i}" for i in range(getattr(lda, "n_components", 5))}
+    else:
+        topic_labels = {}
 
-def clean_text_topic(text):
-    text = re.sub(r"[^a-zA-Z\s]", "", text.lower())
+# If any critical artifact missing -> show error and stop
+missing = []
+if lda is None: missing.append("LDA model (topic_model_lda.pkl)")
+if vectorizer_topic is None: missing.append("Topic vectorizer (topic_vectorizer.pkl)")
+if sentiment_model is None: missing.append("Sentiment classifier (sentiment_classifier.pkl)")
+if tfidf is None: missing.append("TF-IDF vectorizer (sentiment vectorizer)")
+
+if missing:
+    st.error("One or more model artifacts are missing. Please ensure the following files exist in `./model` or project root:")
+    for m in missing:
+        st.write(f"- {m}")
+    st.stop()
+
+st.success("Models loaded successfully.")
+
+# ---------------------------
+# Preprocessing (no NLTK stopwords/punkt use)
+# ---------------------------
+
+# Internal stopword list (keeps app self-contained; extend as needed)
+STOP_WORDS = {
+    "the","and","is","in","of","for","to","on","with","was","it","as","this","that","are","be","by","an","or","at","from","but",
+    "we","they","you","i","a","about","into","more","so","can","if","when","what","how","which","their","there","my","our",
+    "course","lecturer","lectures","class","classes","would","could","also","not","very"
+}
+
+# Try to use PorterStemmer if nltk is installed; otherwise, use identity stemmer
+try:
+    from nltk.stem import PorterStemmer
+    stemmer = PorterStemmer()
+    def _stem_word(w): return stemmer.stem(w)
+except Exception:
+    def _stem_word(w): return w  # no-op stemmer
+
+def clean_text_topic(text: str) -> str:
+    """Light cleaning for topic modeling (lowercase, remove non-letters, collapse spaces)."""
+    text = re.sub(r"[^a-zA-Z\s]", "", str(text).lower())
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def clean_text_sentiment(text):
-    text = text.lower()
-    text = re.sub(r"[^a-zA-Z\s]", "", text)
-    tokens = nltk.word_tokenize(text)
-    filtered = [w for w in tokens if w not in stop_words]
-    stemmed = [stemmer.stem(w) for w in filtered]
-    return " ".join(stemmed)
+def clean_text_sentiment(text: str) -> str:
+    """Cleaning for sentiment pipeline (no external tokenizers)."""
+    text = re.sub(r"[^a-zA-Z\s]", "", str(text).lower())
+    tokens = text.split()  # simple split avoids punkt/tokenizer requirement
+    tokens = [t for t in tokens if t not in STOP_WORDS]
+    tokens = [_stem_word(t) for t in tokens]
+    return " ".join(tokens)
 
-# =============================
-# Prediction Functions
-# =============================
-
-def predict_topic(comment):
+# ---------------------------
+# Prediction functions
+# ---------------------------
+def predict_topic(comment: str):
     cleaned = clean_text_topic(comment)
     X = vectorizer_topic.transform([cleaned])
     topic_distribution = lda.transform(X)[0]
     topic_id = int(np.argmax(topic_distribution))
-
     return {
         "topic_id": topic_id,
-        "topic_label": topic_labels.get(topic_id, "Unknown Topic"),
+        "topic_label": topic_labels.get(topic_id, f"Topic {topic_id}"),
         "probability": float(topic_distribution[topic_id])
     }
 
-def predict_sentiment(comment):
+def predict_sentiment(comment: str):
     cleaned = clean_text_sentiment(comment)
     vector = tfidf.transform([cleaned])
-
     pred = sentiment_model.predict(vector)[0]
-    confidence = sentiment_model.predict_proba(vector).max()
+    # some classifiers may not implement predict_proba (e.g., SVC without prob)
+    try:
+        confidence = float(sentiment_model.predict_proba(vector).max())
+    except Exception:
+        confidence = 0.0
+    return pred, round(confidence, 3)
 
-    return pred, round(float(confidence), 3)
-
-# =============================
-# STREAMLIT UI
-# =============================
-
+# ---------------------------
+# Streamlit UI
+# ---------------------------
 st.title("📘 Student Course Evaluation Analyzer")
-st.subheader("🔍 Topic Detection + 😊 Sentiment Analysis")
+st.markdown(
+    "Enter one student's textual evaluation below. The app returns the **predicted topic** and the **sentiment**."
+)
 
-user_input = st.text_area("Enter a student's evaluation:", height=150)
+with st.form(key="analysis_form"):
+    user_input = st.text_area("Student evaluation (one entry):", height=180)
+    submitted = st.form_submit_button("Analyze")
 
-if st.button("Analyze"):
-    if user_input.strip() == "":
-        st.warning("Please enter some text.")
+if submitted:
+    if not user_input or user_input.strip() == "":
+        st.warning("Please enter some text to analyze.")
     else:
-        topic_result = predict_topic(user_input)
-        sentiment, confidence = predict_sentiment(user_input)
+        with st.spinner("Analyzing..."):
+            try:
+                topic_result = predict_topic(user_input)
+                sentiment_label, confidence = predict_sentiment(user_input)
+            except Exception as e:
+                st.error(f"Error during prediction: {e}")
+                raise
 
-        st.success("Analysis Complete ✔")
+        st.success("Analysis complete ✔")
 
-        st.write("### 🧩 Predicted Topic")
+        st.subheader("🧩 Predicted Topic")
         st.write(f"**Topic Label:** {topic_result['topic_label']}")
         st.write(f"**Topic ID:** {topic_result['topic_id']}")
         st.write(f"**Probability:** {topic_result['probability']:.4f}")
 
-        st.write("### 😊 Sentiment Analysis")
-        sentiment_color = {
-            "positive": "green",
-            "neutral": "orange",
-            "negative": "red"
-        }.get(sentiment, "black")
-
-        st.markdown(f"**Sentiment:** <span style='color:{sentiment_color}'>{sentiment}</span>", unsafe_allow_html=True)
+        st.subheader("😊 Sentiment Analysis")
+        sentiment_color = {"positive": "green", "neutral": "orange", "negative": "red"}.get(sentiment_label, "black")
+        st.markdown(f"**Sentiment:** <span style='color:{sentiment_color}'>{sentiment_label}</span>", unsafe_allow_html=True)
         st.write(f"**Confidence:** {confidence * 100:.1f}%")
+
+# Optional: small help / notes
+st.markdown("---")
+st.markdown(
+    "Notes: This app expects model artifacts saved under `./model/` (or project root). "
+    "If you trained models elsewhere, place the following files in `./model/`:\n\n"
+    "- `topic_model_lda.pkl`\n- `topic_vectorizer.pkl`\n- `sentiment_classifier.pkl`\n- `topic_vectorizer_using_tfidf.pkl` OR `sentiment_vectorizer.pkl`\n\n"
+    "If you need, I can help rename/move your artifacts so the app finds them automatically."
+)
